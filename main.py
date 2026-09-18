@@ -1,17 +1,25 @@
 import os
+import re
 import uuid
-import shutil
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="VidStream Downloader API")
 
+app = FastAPI(title="VidStream Downloader")
+
+
+# -----------------------------
 # CORS
+# -----------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,40 +28,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# -----------------------------
+# Download directory
+# -----------------------------
+
 DOWNLOAD_DIR = Path("/tmp/vidstream_downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def valid_youtube_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        hostname = parsed.hostname or ""
+# -----------------------------
+# Helpers
+# -----------------------------
 
-        return (
-            hostname == "youtube.com"
-            or hostname.endswith(".youtube.com")
-            or hostname == "youtu.be"
-            or hostname.endswith(".youtu.be")
-        )
+def is_youtube_url(url: str) -> bool:
+    try:
+        hostname = (urlparse(url).hostname or "").lower()
+
+        return hostname in [
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "www.youtu.be",
+        ] or hostname.endswith(".youtube.com")
+
     except Exception:
         return False
 
 
-def clean_old_files():
+def safe_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = name.strip().strip(".")
+    return name[:100] or "VidStream Video"
+
+
+def remove_file(file_path: str):
     try:
-        for file in DOWNLOAD_DIR.iterdir():
-            if file.is_file():
-                file.unlink()
+        path = Path(file_path)
+
+        if path.exists():
+            path.unlink()
+
     except Exception:
         pass
 
 
+def get_quality(quality: str) -> int:
+    try:
+        value = int(
+            str(quality)
+            .lower()
+            .replace("p", "")
+            .strip()
+        )
+
+        allowed = [
+            144,
+            240,
+            360,
+            480,
+            720,
+            1080,
+            1440,
+            2160
+        ]
+
+        if value in allowed:
+            return value
+
+        return 720
+
+    except Exception:
+        return 720
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+
 @app.get("/")
-def home():
+def root():
     return {
         "status": "online",
-        "service": "VidStream Downloader",
-        "message": "API is running"
+        "service": "VidStream Downloader"
     }
 
 
@@ -65,7 +123,7 @@ def health():
 
 
 @app.get("/download")
-def download_video(
+def download(
     url: str = Query(...),
     quality: str = Query("720p"),
     format: str = Query("video")
@@ -73,36 +131,38 @@ def download_video(
     if not url:
         return JSONResponse(
             status_code=400,
-            content={"error": "Video URL is required"}
+            content={
+                "error": "Video URL is required"
+            }
         )
 
-    if not valid_youtube_url(url):
+    if not is_youtube_url(url):
         return JSONResponse(
             status_code=400,
-            content={"error": "Only YouTube URLs are supported"}
+            content={
+                "error": "Please provide a valid YouTube URL"
+            }
         )
 
-    # Convert quality values such as 720p or 720 into a number
-    quality_value = str(quality).lower().replace("p", "").strip()
-
-    try:
-        height = int(quality_value)
-    except ValueError:
-        height = 720
-
-    if height not in [144, 240, 360, 480, 720, 1080, 1440, 2160]:
-        height = 720
-
-    # Prevent unlimited disk usage
-    clean_old_files()
+    height = get_quality(quality)
 
     download_id = uuid.uuid4().hex
 
-    if format.lower() in ["audio", "mp3", "music"]:
-        output_template = str(
-            DOWNLOAD_DIR / f"{download_id}.%(ext)s"
-        )
+    output_template = str(
+        DOWNLOAD_DIR / f"{download_id}.%(ext)s"
+    )
 
+    selected_format = str(format).lower().strip()
+
+    # -----------------------------
+    # Audio download
+    # -----------------------------
+
+    if selected_format in [
+        "audio",
+        "mp3",
+        "music"
+    ]:
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": output_template,
@@ -112,23 +172,29 @@ def download_video(
             "retries": 3,
             "fragment_retries": 3,
             "socket_timeout": 30,
+
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android_vr", "web"]
+                    "player_client": [
+                        "android_vr",
+                        "web"
+                    ]
                 }
             }
         }
 
-    else:
-        output_template = str(
-            DOWNLOAD_DIR / f"{download_id}.%(ext)s"
-        )
+    # -----------------------------
+    # Video download
+    # -----------------------------
 
+    else:
         ydl_opts = {
             "format": (
                 f"best[height<={height}][ext=mp4]/"
-                f"best[height<={height}]/best"
+                f"best[height<={height}]/"
+                "best"
             ),
+
             "outtmpl": output_template,
             "noplaylist": True,
             "quiet": True,
@@ -136,75 +202,123 @@ def download_video(
             "retries": 3,
             "fragment_retries": 3,
             "socket_timeout": 30,
+
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android_vr", "web"]
+                    "player_client": [
+                        "android_vr",
+                        "web"
+                    ]
                 }
             }
         }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(
+                url,
+                download=True
+            )
 
-            downloaded_file = Path(
+            file_path = Path(
                 ydl.prepare_filename(info)
             )
 
-            # Find actual file if extension changed
-            if not downloaded_file.exists():
-                possible_files = list(
-                    DOWNLOAD_DIR.glob(f"{download_id}.*")
+            # Handle changed extension
+            if not file_path.exists():
+                matching_files = list(
+                    DOWNLOAD_DIR.glob(
+                        f"{download_id}.*"
+                    )
                 )
 
-                if not possible_files:
+                if not matching_files:
                     return JSONResponse(
                         status_code=500,
                         content={
-                            "error": "Downloaded file was not found"
+                            "error": "Downloaded file not found"
                         }
                     )
 
-                downloaded_file = possible_files[0]
+                file_path = matching_files[0]
 
-        if not downloaded_file.exists():
-            return JSONResponse(
-                status_code=500,
-                content={"error": "File does not exist"}
+            title = safe_filename(
+                info.get("title", "VidStream Video")
             )
 
-        if format.lower() in ["audio", "mp3", "music"]:
-            media_type = "audio/mpeg"
-            filename = "vidstream-audio" + downloaded_file.suffix
+        if not file_path.exists():
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "File does not exist"
+                }
+            )
+
+        extension = file_path.suffix.lower()
+
+        if selected_format in [
+            "audio",
+            "mp3",
+            "music"
+        ]:
+            filename = f"{title}{extension}"
+            media_type = (
+                mimetypes.guess_type(
+                    str(file_path)
+                )[0]
+                or "audio/mpeg"
+            )
+
         else:
-            media_type = "video/mp4"
-            filename = "vidstream-video" + downloaded_file.suffix
+            filename = f"{title}{extension}"
+            media_type = (
+                mimetypes.guess_type(
+                    str(file_path)
+                )[0]
+                or "video/mp4"
+            )
+
+        # Send file as an attachment to Android browser
+        headers = {
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            ),
+            "Cache-Control": "no-cache",
+            "Access-Control-Expose-Headers": (
+                "Content-Disposition, Content-Length"
+            )
+        }
 
         return FileResponse(
-            path=str(downloaded_file),
+            path=str(file_path),
             media_type=media_type,
-            filename=filename
+            filename=filename,
+            headers=headers,
+            background=BackgroundTask(
+                remove_file,
+                str(file_path)
+            )
         )
 
     except yt_dlp.utils.DownloadError as error:
-        error_message = str(error)
+        message = str(error)
 
-        if "Sign in to confirm" in error_message:
+        if "Sign in to confirm" in message:
             return JSONResponse(
                 status_code=403,
                 content={
                     "error": (
-                        "YouTube requested bot verification. "
-                        "This video cannot be downloaded currently."
+                        "YouTube bot verification blocked "
+                        "this video."
                     ),
-                    "details": error_message
+                    "details": message
                 }
             )
 
         return JSONResponse(
             status_code=500,
             content={
-                "error": error_message
+                "error": message
             }
         )
 
