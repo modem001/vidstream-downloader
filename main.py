@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse
 import yt_dlp
 import tempfile
 import os
+import re
 
 app = FastAPI()
 
@@ -23,40 +24,42 @@ def download_video(
 ):
     temp_dir = tempfile.mkdtemp()
 
+    quality_number = re.search(r"\d+", str(quality))
+    height = quality_number.group() if quality_number else "720"
+
     output_template = os.path.join(
         temp_dir,
         "%(title)s.%(ext)s"
     )
 
-    options = {
-        "outtmpl": output_template,
-        "quiet": True,
-        "noplaylist": True,
-    }
-
-    if format == "audio":
-        options.update({
+    if format.lower() == "audio":
+        options = {
             "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }]
-        })
+            "outtmpl": output_template,
+            "quiet": True,
+            "noplaylist": True
+        }
     else:
-        options["format"] = (
-            f"best[height<={quality}][ext=mp4]/best"
-        )
+        options = {
+            "format": (
+                f"best[height<={height}]/"
+                "best"
+            ),
+            "outtmpl": output_template,
+            "quiet": True,
+            "noplaylist": True
+        }
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             downloaded_file = ydl.prepare_filename(info)
 
-        if format == "audio":
-            downloaded_file = os.path.splitext(
-                downloaded_file
-            )[0] + ".mp3"
+        if not os.path.exists(downloaded_file):
+            files = os.listdir(temp_dir)
+            if not files:
+                return {"error": "Ba a samu file ba"}
+            downloaded_file = os.path.join(temp_dir, files[0])
 
         return FileResponse(
             downloaded_file,
